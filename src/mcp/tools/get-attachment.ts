@@ -28,16 +28,6 @@ export function findAttachment(msg: Message<true>, attachmentId: string): Attach
   );
 }
 
-// Временная диагностика: на промахе логируем только id и структуру снапшотов (без содержимого и
-// URL), чтобы отличить «REST отдал объект без messageSnapshots» от «id вложения не тот».
-function snapshotDiag(msg: Message<true>): Record<string, unknown> {
-  return {
-    topLevelAttachmentIds: [...msg.attachments.keys()],
-    snapshotCount: msg.messageSnapshots.size,
-    snapshotAttachmentIds: [...msg.messageSnapshots.values()].flatMap((s) => [...s.attachments.keys()]),
-  };
-}
-
 // Ищем вложение, при промахе один раз перечитав сообщение из REST (force): холодный/конкурентный
 // кэш discord.js порой отдаёт объект без полностью загруженных messageSnapshots, и вложение форварда
 // «пропадает». Обычный путь остаётся на кэше — лишний REST только при промахе.
@@ -45,16 +35,9 @@ export async function resolveAttachment(
   fetchMsg: (force: boolean) => Promise<Message<true>>,
   attachmentId: string,
 ): Promise<Attachment | undefined> {
-  const cached = await fetchMsg(false);
-  const inCache = findAttachment(cached, attachmentId);
-  if (inCache) return inCache;
-  console.warn('forwarded attachment miss', { attachmentId, phase: 'cached', ...snapshotDiag(cached) });
-
-  const fresh = await fetchMsg(true);
-  const inFresh = findAttachment(fresh, attachmentId);
-  if (inFresh) return inFresh;
-  console.warn('forwarded attachment miss', { attachmentId, phase: 'fresh', ...snapshotDiag(fresh) });
-  return undefined;
+  const cached = findAttachment(await fetchMsg(false), attachmentId);
+  if (cached) return cached;
+  return findAttachment(await fetchMsg(true), attachmentId);
 }
 
 // get_attachment — отдать САМО вложение, а не только ссылку: картинку как image-контент (Claude
