@@ -33,7 +33,7 @@ export interface FetchMessagesOptions {
   around?: string;
 }
 
-// Одно сообщение по id. Годится и для get_attachment: вложение берётся из msg.attachments.
+// Одно сообщение по id (get_message и get_attachment).
 export async function fetchMessage(
   client: Client,
   userId: string,

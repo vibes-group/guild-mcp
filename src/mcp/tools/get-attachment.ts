@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { Attachment, Message } from 'discord.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { callerFromAuth } from '../../auth/session.js';
 import { fetchMessage } from '../../discord/messages.js';
@@ -13,6 +14,17 @@ function isTextType(mime: string | null): boolean {
   return (
     mime.startsWith('text/') ||
     /^application\/(json|xml|x-yaml|yaml|javascript|csv|x-sh)(;|$)/.test(mime)
+  );
+}
+
+// Форвард (messageSnapshots) уже легально виден вызвавшему — он видит сообщение-контейнер; по
+// reference к оригиналу не идём: исходный канал может быть ему недоступен.
+export function findAttachment(msg: Message<true>, attachmentId: string): Attachment | undefined {
+  return (
+    msg.attachments.get(attachmentId) ??
+    [...msg.messageSnapshots.values()]
+      .map((s) => s.attachments.get(attachmentId))
+      .find((a) => a !== undefined)
   );
 }
 
@@ -39,7 +51,7 @@ export function registerGetAttachment(server: McpServer, deps: ToolDeps): void {
       let attachment;
       try {
         const msg = await fetchMessage(deps.discord, caller.userId, args.channelId, args.messageId);
-        attachment = msg.attachments.get(args.attachmentId);
+        attachment = findAttachment(msg, args.attachmentId);
       } catch (e) {
         return fetchErrorResult(e, `Failed to fetch message ${args.messageId} in channel ${args.channelId}`);
       }
