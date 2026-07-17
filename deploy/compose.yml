@@ -1,0 +1,59 @@
+# Боевой compose на сервере; .env рядом даёт IMAGE_TAG и секреты.
+
+# Закреплено, чтобы том с БД оставался guild-mcp_guild-data при любом каталоге запуска.
+name: guild-mcp
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  app:
+    image: ghcr.io/klimovi/guild-mcp:${IMAGE_TAG:?IMAGE_TAG is required}
+    restart: unless-stopped
+    env_file: .env
+    logging: *default-logging
+    read_only: true # пишем только в том SQLite и tmpfs
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - guild-data:/app/data
+    expose:
+      - "3000"
+    networks: [web]
+    # node:24-slim без curl/wget → TCP-проверка порта самим node
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('net').connect(Number(process.env.PORT)||3000,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+  # CF Tunnel: только исходящее к CF; ingress (hostname→app:3000) — в дашборде туннеля
+  cloudflared:
+    image: cloudflare/cloudflared:2026.7.1
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    logging: *default-logging
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN:?TUNNEL_TOKEN is required}
+    networks: [web]
+
+volumes:
+  guild-data:
+
+networks:
+  web:

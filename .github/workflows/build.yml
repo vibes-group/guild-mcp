@@ -1,0 +1,179 @@
+name: Build and deploy
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'src/**'
+      - 'test/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
+      - 'Dockerfile'
+      - 'deploy/**'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - run: npm ci
+
+      - run: npm run build
+
+      - run: npm test
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/guild-mcp
+          tags: |
+            type=sha,format=long,prefix=
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha,scope=guild-mcp
+          cache-to: type=gha,scope=guild-mcp,mode=max
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    concurrency:
+      group: deploy-guild-mcp
+      cancel-in-progress: false
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_DIR: /opt/guild-mcp
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST_KEY: ${{ secrets.DEPLOY_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY"  > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$DEPLOY_HOST_KEY" > ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts
+
+      - name: Write .env to host
+        env:
+          ENV_CONTENT: |
+            IMAGE_TAG=${{ needs.build.outputs.image_tag }}
+            DISCORD_BOT_TOKEN=${{ secrets.DISCORD_BOT_TOKEN }}
+            DISCORD_CLIENT_ID=${{ secrets.DISCORD_CLIENT_ID }}
+            DISCORD_CLIENT_SECRET=${{ secrets.DISCORD_CLIENT_SECRET }}
+            OAUTH_REDIRECT_URI=${{ secrets.OAUTH_REDIRECT_URI }}
+            PUBLIC_BASE_URL=${{ secrets.PUBLIC_BASE_URL }}
+            TUNNEL_TOKEN=${{ secrets.TUNNEL_TOKEN }}
+            PORT=3000
+            DB_PATH=./data/guild-mcp.db
+        run: |
+          set -euo pipefail
+          umask 077
+          trap 'rm -f .env.deploy' EXIT
+          printf '%s\n' "$ENV_CONTENT" > .env.deploy
+          ssh "deploy@$DEPLOY_HOST" "mkdir -p $DEPLOY_DIR"
+          scp .env.deploy "deploy@$DEPLOY_HOST:$DEPLOY_DIR/.env"
+          ssh "deploy@$DEPLOY_HOST" "chmod 600 $DEPLOY_DIR/.env"
+
+      - name: Install compose
+        run: |
+          set -euo pipefail
+          scp deploy/compose.yml "deploy@$DEPLOY_HOST:$DEPLOY_DIR/compose.yml.tmp"
+          ssh "deploy@$DEPLOY_HOST" DEPLOY_DIR="$DEPLOY_DIR" bash -s <<'EOF'
+            set -euo pipefail
+            cd "$DEPLOY_DIR"
+            trap 'rm -f compose.yml.tmp' EXIT
+            docker compose -f compose.yml.tmp config --quiet
+            mv -f compose.yml.tmp compose.yml
+            trap - EXIT
+          EOF
+
+      - name: Pull and restart
+        run: |
+          set -euo pipefail
+          ssh "deploy@$DEPLOY_HOST" DEPLOY_DIR="$DEPLOY_DIR" bash -s <<'EOF'
+            set -euo pipefail
+            exec 9>"$DEPLOY_DIR/.deploy.lock"
+            flock -x 9
+            cd "$DEPLOY_DIR"
+            docker compose pull
+            docker compose up -d --remove-orphans
+          EOF
+
+      - name: Health poll
+        run: |
+          set -euo pipefail
+          ssh "deploy@$DEPLOY_HOST" DEPLOY_DIR="$DEPLOY_DIR" bash -s <<'EOF'
+            set -euo pipefail
+            cd "$DEPLOY_DIR"
+            for i in $(seq 1 60); do
+              status=$(docker compose ps app --format "{{.Health}}")
+              if [ "$status" = "healthy" ]; then
+                echo "app healthy on attempt $i"
+                exit 0
+              fi
+              echo "attempt $i: status=$status, retrying in 2s..."
+              sleep 2
+            done
+            echo "app never reported healthy" >&2
+            docker compose ps
+            docker compose logs --tail 80 >&2
+            exit 1
+          EOF
+
+      - name: Prune unused images
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          ssh "deploy@$DEPLOY_HOST" DEPLOY_DIR="$DEPLOY_DIR" bash -s <<'EOF'
+            set -euo pipefail
+            flock -x "$DEPLOY_DIR/.deploy.lock" docker image prune -af
+          EOF
