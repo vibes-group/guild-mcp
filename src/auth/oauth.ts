@@ -255,10 +255,11 @@ export function mountAuth(app: Application, config: Config, provider: DiscordFed
       .then((redirect) => res.redirect(redirect))
       .catch((e: unknown) => {
         if (e instanceof AuthorizationDeniedError) {
-          res.status(403).send(`Access denied. ${e.message}`);
+          res.status(403).send('Access denied. You are not a member of any Discord server this bot is in.');
           return;
         }
-        res.status(400).send(`oauth callback error: ${(e as Error).message}`);
+        console.error('oauth callback error:', e);
+        res.status(400).send('OAuth callback failed.');
       });
   });
 }
